@@ -1,6 +1,7 @@
 import asyncio
 import yt_dlp
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 YDL_OPTIONS = {
@@ -19,7 +20,6 @@ FFMPEG_OPTIONS = {
 
 
 def get_spotify_query(url: str) -> str | None:
-    """Convert a Spotify URL to a search query via the Spotify API if configured."""
     import os
     import re
 
@@ -76,7 +76,6 @@ class Music(commands.Cog):
         return self.queues[guild_id]
 
     async def resolve_entries(self, query: str) -> list[dict]:
-        """Resolve a URL or search query to a list of yt-dlp entries."""
         if query.startswith("http") and "spotify.com" in query:
             resolved = get_spotify_query(query)
             if resolved:
@@ -94,76 +93,94 @@ class Music(commands.Cog):
             return [e for e in info["entries"] if e]
         return [info]
 
-    def play_next(self, ctx: commands.Context):
-        queue = self.get_queue(ctx.guild.id)
+    def play_next(self, interaction: discord.Interaction):
+        queue = self.get_queue(interaction.guild_id)
         entry = queue.next()
         if not entry:
             return
 
         source = discord.FFmpegPCMAudio(entry["url"], **FFMPEG_OPTIONS)
-        ctx.voice_client.play(
+        interaction.guild.voice_client.play(
             discord.PCMVolumeTransformer(source, volume=0.5),
-            after=lambda e: self.bot.loop.call_soon_threadsafe(self.play_next, ctx),
+            after=lambda e: self.bot.loop.call_soon_threadsafe(self.play_next, interaction),
         )
         asyncio.run_coroutine_threadsafe(
-            ctx.send(f":musical_note: Now playing: **{entry.get('title', 'Unknown')}**"),
+            interaction.channel.send(f":musical_note: Now playing: **{entry.get('title', 'Unknown')}**"),
             self.bot.loop,
         )
 
-    @commands.command(aliases=["p"])
-    async def play(self, ctx: commands.Context, *, query: str):
-        """Play a song or playlist from a URL or search query."""
-        if not ctx.author.voice:
-            return await ctx.send("You need to be in a voice channel.")
+    @app_commands.command(name="play", description="Play a song or playlist from a URL or search query")
+    @app_commands.describe(query="YouTube/Spotify URL or search terms")
+    async def play(self, interaction: discord.Interaction, query: str):
+        if not interaction.user.voice:
+            return await interaction.response.send_message("You need to be in a voice channel.", ephemeral=True)
 
-        if not ctx.voice_client:
-            await ctx.author.voice.channel.connect()
-        elif ctx.voice_client.channel != ctx.author.voice.channel:
-            await ctx.voice_client.move_to(ctx.author.voice.channel)
+        await interaction.response.defer()
 
-        async with ctx.typing():
-            entries = await self.resolve_entries(query)
+        vc = interaction.guild.voice_client
+        if not vc:
+            vc = await interaction.user.voice.channel.connect()
+        elif vc.channel != interaction.user.voice.channel:
+            await vc.move_to(interaction.user.voice.channel)
 
+        entries = await self.resolve_entries(query)
         if not entries:
-            return await ctx.send("Could not find anything for that query.")
+            return await interaction.followup.send("Could not find anything for that query.")
 
-        queue = self.get_queue(ctx.guild.id)
+        queue = self.get_queue(interaction.guild_id)
         for entry in entries:
             queue.add(entry)
 
         if len(entries) > 1:
-            await ctx.send(f"Queued **{len(entries)}** tracks.")
+            await interaction.followup.send(f"Queued **{len(entries)}** tracks.")
         else:
-            await ctx.send(f"Queued: **{entries[0].get('title', 'Unknown')}**")
+            await interaction.followup.send(f"Queued: **{entries[0].get('title', 'Unknown')}**")
 
-        if not ctx.voice_client.is_playing():
-            self.play_next(ctx)
+        if not vc.is_playing() and not vc.is_paused():
+            self.play_next(interaction)
 
-    @commands.command()
-    async def skip(self, ctx: commands.Context):
-        """Skip the current song."""
-        if ctx.voice_client and ctx.voice_client.is_playing():
-            ctx.voice_client.stop()
-            await ctx.send("Skipped.")
+    @app_commands.command(name="skip", description="Skip the current song")
+    async def skip(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        if vc and vc.is_playing():
+            vc.stop()
+            await interaction.response.send_message("Skipped.")
         else:
-            await ctx.send("Nothing is playing.")
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
 
-    @commands.command()
-    async def stop(self, ctx: commands.Context):
-        """Stop playback and clear the queue."""
-        queue = self.get_queue(ctx.guild.id)
+    @app_commands.command(name="stop", description="Stop playback and disconnect")
+    async def stop(self, interaction: discord.Interaction):
+        queue = self.get_queue(interaction.guild_id)
         queue.clear()
-        if ctx.voice_client:
-            ctx.voice_client.stop()
-            await ctx.voice_client.disconnect()
-        await ctx.send("Stopped and disconnected.")
+        vc = interaction.guild.voice_client
+        if vc:
+            vc.stop()
+            await vc.disconnect()
+        await interaction.response.send_message("Stopped and disconnected.")
 
-    @commands.command()
-    async def queue(self, ctx: commands.Context):
-        """Show the current queue."""
-        queue = self.get_queue(ctx.guild.id)
+    @app_commands.command(name="pause", description="Pause playback")
+    async def pause(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        if vc and vc.is_playing():
+            vc.pause()
+            await interaction.response.send_message("Paused.")
+        else:
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+
+    @app_commands.command(name="resume", description="Resume playback")
+    async def resume(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        if vc and vc.is_paused():
+            vc.resume()
+            await interaction.response.send_message("Resumed.")
+        else:
+            await interaction.response.send_message("Nothing is paused.", ephemeral=True)
+
+    @app_commands.command(name="queue", description="Show the current queue")
+    async def queue(self, interaction: discord.Interaction):
+        queue = self.get_queue(interaction.guild_id)
         if not queue.current and not queue.queue:
-            return await ctx.send("The queue is empty.")
+            return await interaction.response.send_message("The queue is empty.")
 
         lines = []
         if queue.current:
@@ -173,31 +190,18 @@ class Music(commands.Cog):
         if len(queue.queue) > 10:
             lines.append(f"...and {len(queue.queue) - 10} more")
 
-        await ctx.send("\n".join(lines))
+        await interaction.response.send_message("\n".join(lines))
 
-    @commands.command()
-    async def pause(self, ctx: commands.Context):
-        """Pause playback."""
-        if ctx.voice_client and ctx.voice_client.is_playing():
-            ctx.voice_client.pause()
-            await ctx.send("Paused.")
-
-    @commands.command()
-    async def resume(self, ctx: commands.Context):
-        """Resume playback."""
-        if ctx.voice_client and ctx.voice_client.is_paused():
-            ctx.voice_client.resume()
-            await ctx.send("Resumed.")
-
-    @commands.command()
-    async def volume(self, ctx: commands.Context, vol: int):
-        """Set volume (0-100)."""
-        if not ctx.voice_client or not ctx.voice_client.source:
-            return await ctx.send("Nothing is playing.")
-        if not 0 <= vol <= 100:
-            return await ctx.send("Volume must be between 0 and 100.")
-        ctx.voice_client.source.volume = vol / 100
-        await ctx.send(f"Volume set to {vol}%.")
+    @app_commands.command(name="volume", description="Set the volume (0-100)")
+    @app_commands.describe(level="Volume level between 0 and 100")
+    async def volume(self, interaction: discord.Interaction, level: int):
+        vc = interaction.guild.voice_client
+        if not vc or not vc.source:
+            return await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        if not 0 <= level <= 100:
+            return await interaction.response.send_message("Volume must be between 0 and 100.", ephemeral=True)
+        vc.source.volume = level / 100
+        await interaction.response.send_message(f"Volume set to {level}%.")
 
 
 async def setup(bot: commands.Bot):
